@@ -1,5 +1,5 @@
 name: Whitelist
-version: 1
+version: $SERVICE_TAG
 description: >
   ALv4 Whitelist service
 
@@ -22,9 +22,8 @@ disable_cache: false
 enabled: true
 
 docker_config:
-  image: godfried/whitelist-service:latest
-  #cpu_cores: 1.0
-  #ram_mb: 1024
+  image: ${REGISTRY}cccs/assemblyline-service-whitelist:$SERVICE_TAG
+
 
 dependencies:
   redisdb:
@@ -38,4 +37,4 @@ update_config:
   run_options:
     allow_internet_access: true
     command: ["python",  "whitelist-updater.py"]
-    image: godfried/whitelist-service:latest
+    image: ${REGISTRY}cccs/assemblyline-service-whitelist:$SERVICE_TAG

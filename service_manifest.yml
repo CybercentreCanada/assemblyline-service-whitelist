@@ -1,0 +1,41 @@
+name: Whitelist
+version: 1
+description: >
+  ALv4 Whitelist service
+
+  This service will calculate a SHA1 hash of a submitted file, then lookup this hash in a local Redis set of known good hashes.
+  The service will check https://www.nist.gov/itl/ssd/software-quality-group/national-software-reference-library-nsrl/nsrl-download/current-rds
+  for new hashes automatically every 24 hrs.
+
+accepts: .*
+rejects: empty|metadata/.*
+
+stage: FILTER
+category: Filtering
+
+file_required: true
+# Maximum execution time the service has before it's considered to be timed out
+timeout: 10
+disable_cache: false
+
+# is the service enabled by default
+enabled: true
+
+docker_config:
+  image: godfried/whitelist-service:latest
+  #cpu_cores: 1.0
+  #ram_mb: 1024
+
+dependencies:
+  redisdb:
+    container:
+      image: redis
+
+update_config:
+  update_interval_seconds: 3600
+  generates_signatures: false
+  method: run
+  run_options:
+    allow_internet_access: true
+    command: ["python",  "whitelist-updater.py"]
+    image: godfried/whitelist-service:latest

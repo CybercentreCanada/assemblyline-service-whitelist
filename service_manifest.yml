@@ -24,7 +24,6 @@ enabled: true
 docker_config:
   image: ${REGISTRY}cccs/assemblyline-service-whitelist:$SERVICE_TAG
 
-
 dependencies:
   redisdb:
     container:
@@ -45,7 +44,7 @@ update_config:
   method: run
   run_options:
     allow_internet_access: true
-    command: ["python",  "whitelist-updater.py"]
+    command: ["python",  "updater.py"]
     image: ${REGISTRY}cccs/assemblyline-service-whitelist:$SERVICE_TAG
   sources:
     - name: minimal

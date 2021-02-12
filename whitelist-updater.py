@@ -1,145 +1,212 @@
-# This module checks first online the hash for NSRL file, then compares with hash of local copy.
-# If hashes are different, download new NSRL file
+# This updater is made to follow the NSRL file format which is a CSV file with the following format:
+# "SHA-1","MD5","CRC32","FileName","FileSize","ProductCode","OpSystemCode","SpecialCode"
+#
+# You can then create your own whitelist set that matches that format to have your own set of hashes...
+import json
 
+import certifi
 import logging
 import os
 import pycdlib
 import requests
+import shutil
 import subprocess
 import tempfile
+import time
+import yaml
 import zipfile
 
-from util import download_big_file
-from util import calculate_sha1
-
 from assemblyline.common import log
+from assemblyline.common.isotime import iso_to_epoch
 
 try:
     from cStringIO import StringIO as BytesIO
 except ImportError:
     from io import BytesIO
 
-
-def get_online_hashes(cur_logger):
-    hashes = {}
-    hash_url = 'https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/current/version.txt'
-    cur_logger.info("Downloading online rds_modernm hash from %s" % hash_url)
-
-    res = requests.get(hash_url)
-
-    if res.ok:
-        for line in res.text.split("\n"):
-            if "," in line:
-                cur_hash, version_info = [x.strip("\"") for x in line.strip().split(",")]
-                date, version, iso_type = version_info.split(" ")
-                hashes[iso_type] = {
-                    'hash': cur_hash.upper(),
-                    'date': date,
-                    'version': version
-                }
-
-    return hashes
+UPDATE_CONFIGURATION_PATH = os.environ.get('UPDATE_CONFIGURATION_PATH', "/tmp/whitelist_updater_config.yaml")
 
 
-def download_extract_zip(cur_logger, url, target_path, extracted_path, internal_file):
-    cur_logger.info(f"Downloading RDS ZIP from {url}...")
-    download_big_file(url, target_path)
-
-    cur_logger.info(f"Unzipping downloaded file {target_path}... into {extracted_path}")
-
-    with zipfile.ZipFile(target_path) as z:
-        with open(extracted_path, 'wb') as f:
-            # TODO: do block by block cause I'm getting OOMKilled
-            f.write(z.read(internal_file))
-    cur_logger.info(f"Unzip finished, created file {extracted_path}")
+BLOCK_SIZE = 64 * 1024
 
 
-def download_extract_iso(cur_logger, url, target_path, extracted_path, internal_file):
-    cur_logger.info(f"Downloading RDS ISO from {url}...")
-    download_big_file(url, target_path)
-    zip_file = f"{target_path}.zip"
-
-    iso = pycdlib.PyCdlib()
-    iso.open(target_path)
-
-    cur_logger.info("ISO contains followings files:")
-
-    for child in iso.list_children(iso_path='/'):
-        cur_logger.info(child.file_identifier())
-
-    cur_logger.info("Extracting NSRLFILE.ZIP form ISO...")
-    with open(zip_file, "wb") as zip_fh:
-        iso.get_file_from_iso_fp(zip_fh, iso_path='/NSRLFILE.ZIP;1')
-    iso.close()
-
-    cur_logger.info(f"Unzipping {zip_file} ...")
-
-    with zipfile.ZipFile(zip_file) as z:
-        with open(extracted_path, 'wb') as f:
-            # TODO: do block by block cause I'm getting OOMKilled
-            f.write(z.read(internal_file))
-    cur_logger.info(f"Unzip finished, created file {extracted_path}")
+def add_cacert(cert: str):
+    # Add certificate to requests
+    cafile = certifi.where()
+    with open(cafile, 'a') as ca_editor:
+        ca_editor.write(f"\n{cert}")
 
 
-def update(cur_logger, working_directory, hashes, iso_type, url, download_name, internal_file):
-    cur_logger.info(f"Checking for updates on RDS - {iso_type.upper()}")
-    if iso_type not in hashes:
-        cur_logger.error(f"Failed to find hash for {iso_type.upper()}!")
-        return
+def url_download(source, target_path, cur_logger, previous_update=None):
+    uri = source['uri']
+    username = source.get('username', None)
+    password = source.get('password', None)
+    ca_cert = source.get('ca_cert', None)
+    ignore_ssl_errors = source.get('ssl_ignore_errors', False)
+    auth = (username, password) if username and password else None
 
-    cur_logger.info(f"Online hash is: {hashes[iso_type]['hash']}")
-    target_path = os.path.join(working_directory, download_name)
-    extracted_path = os.path.join(working_directory, f"NSRL_{iso_type}.txt")
+    proxy = source.get('proxy', None)
+    headers = source.get('headers', None)
 
-    file_exist = False
+    cur_logger.info(f"This source is configured to {'ignore SSL errors' if ignore_ssl_errors else 'verify SSL'}.")
+    if ca_cert:
+        cur_logger.info("A CA certificate has been provided with this source.")
+        add_cacert(ca_cert)
 
-    if os.path.isfile(target_path) and os.path.isfile(extracted_path):
-        cur_logger.info(f"{download_name} already exist on disk, validating hash...")
-        local_hash = calculate_sha1(target_path)
-        if local_hash == hashes[iso_type]['hash']:
-            cur_logger.info("The hashes match, we don't have to re-download!")
-            file_exist = True
+    # Create a requests session
+    session = requests.Session()
+    session.verify = not ignore_ssl_errors
 
-    if not file_exist:
-        if download_name.endswith(".zip"):
-            download_extract_zip(cur_logger, url, target_path, extracted_path, internal_file)
-        else:
-            download_extract_iso(cur_logger, url, target_path, extracted_path, internal_file)
+    # Let https requests go through proxy
+    if proxy:
+        os.environ['https_proxy'] = proxy
 
+    try:
+        if isinstance(previous_update, str):
+            previous_update = iso_to_epoch(previous_update)
+
+        # Check the response header for the last modified date
+        response = session.head(uri, auth=auth, headers=headers)
+        last_modified = response.headers.get('Last-Modified', None)
+        if last_modified:
+            # Convert the last modified time to epoch
+            last_modified = time.mktime(time.strptime(last_modified, "%a, %d %b %Y %H:%M:%S %Z"))
+
+            # Compare the last modified time with the last updated time
+            if previous_update and last_modified <= previous_update:
+                # File has not been modified since last update, do nothing
+                cur_logger.info("The file has not been modified since last run, skipping...")
+                return False
+
+        if previous_update:
+            previous_update = time.strftime("%a, %d %b %Y %H:%M:%S %Z", time.gmtime(previous_update))
+            if headers:
+                headers['If-Modified-Since'] = previous_update
+            else:
+                headers = {'If-Modified-Since': previous_update}
+
+        cur_logger.info(f"Downloading file from: {source['uri']}")
+        with session.get(uri, auth=auth, headers=headers, stream=True) as response:
+            # Check the response code
+            if response.status_code == requests.codes['not_modified']:
+                # File has not been modified since last update, do nothing
+                cur_logger.info("The file has not been modified since last run, skipping...")
+                return False
+            elif response.ok:
+                with open(target_path, 'wb') as f:
+                    for content in response.iter_content(BLOCK_SIZE):
+                        f.write(content)
+
+                # Clear proxy setting
+                if proxy:
+                    del os.environ['https_proxy']
+
+                # Return file_path
+                return True
+    except requests.Timeout:
+        pass
+    except Exception as e:
+        # Catch all other types of exceptions such as ConnectionError, ProxyError, etc.
+        cur_logger.info(str(e))
+        return False
+    finally:
+        # Close the requests session
+        session.close()
+
+
+def download_extract_zip(cur_logger, source, target_path, extracted_path, working_directory, previous_update):
+    if url_download(source, target_path, cur_logger, previous_update=previous_update):
+        cur_logger.info(f"Unzipping downloaded file {target_path}... into {extracted_path}")
+
+        with zipfile.ZipFile(target_path) as z:
+            z.extract(source['pattern'], working_directory)
+        os.unlink(target_path)
+
+        os.rename(os.path.join(working_directory, source['pattern']), extracted_path)
+        cur_logger.info(f"Unzip finished, created file {extracted_path}")
+
+
+def download_extract_iso(cur_logger, source, target_path, extracted_path, working_directory, previous_update):
+    # NSRL ISO only!
+    if url_download(source, target_path, cur_logger, previous_update=previous_update):
+        zip_file = f"{target_path}.zip"
+
+        iso = pycdlib.PyCdlib()
+        iso.open(target_path)
+
+        cur_logger.info("Extracting NSRLFILE.ZIP form ISO...")
+        with open(zip_file, "wb") as zip_fh:
+            iso.get_file_from_iso_fp(zip_fh, iso_path='/NSRLFILE.ZIP;1')
+        iso.close()
+        os.unlink(target_path)
+
+        cur_logger.info(f"Unzipping {zip_file} ...")
+        with zipfile.ZipFile(zip_file) as z:
+            z.extract(source['pattern'], working_directory)
+        os.unlink(zip_file)
+
+        os.rename(os.path.join(working_directory, source['pattern']), extracted_path)
+        cur_logger.info(f"Unzip finished, created file {extracted_path}")
+
+
+def update(cur_logger, working_directory, source, previous_update, previous_hash):
+    cur_logger.info(f"Processing source: {source['name'].upper()}")
+    download_name = os.path.basename(source['uri'])
+    target_path = os.path.join(working_directory, 'dl', download_name)
+    extracted_path = os.path.join(working_directory, source['name'])
+
+    if download_name.endswith(".zip"):
+        download_extract_zip(cur_logger, source, target_path,
+                             extracted_path, working_directory, previous_update)
+    elif download_name.endswith(".iso"):
+        download_extract_iso(cur_logger, source, target_path,
+                             extracted_path, working_directory, previous_update)
+    else:
+        url_download(source, extracted_path, cur_logger, previous_update=previous_update)
+
+    if os.path.exists(extracted_path) and os.path.isfile(extracted_path):
         linux_command = "awk -F, 'NR > 1{ print \"sadd\", \"\\\"hashes\\\"\", \"\"$1\"\" }' " \
                         "%s | redis-cli --pipe" % extracted_path
         cur_logger.info(
             "Going to import %s into Redis by executing system command %s " %
             (extracted_path, linux_command))
         result = subprocess.run([linux_command], stdout=subprocess.PIPE, shell=True)
-        cur_logger.info("Import finished with output %s" % result.stdout)
+        os.unlink(extracted_path)
 
-    else:
-        cur_logger.info("Online hash and local hash are the same, skipping...")
+        cur_logger.info("Import finished with output:")
+        for line in result.stdout.split(b"\n"):
+            cur_logger.info(f"\t{line.decode()}")
 
 
-def run_updater(cur_logger):
+def run_updater(cur_logger, update_config_path):
     # Setup working directory
     working_directory = os.path.join(tempfile.gettempdir(), 'whitelist_updates')
-    # TODO: Cleanup ?
-    # shutil.rmtree(working_directory, ignore_errors=True)
-    os.makedirs(working_directory, exist_ok=True)
+    shutil.rmtree(working_directory, ignore_errors=True)
+    os.makedirs(os.path.join(working_directory, 'dl'), exist_ok=True)
 
-    # Get hashes
-    hashes = get_online_hashes(cur_logger)
+    update_config = {}
+    if update_config_path and os.path.exists(update_config_path):
+        with open(update_config_path, 'r') as yml_fh:
+            update_config = yaml.safe_load(yml_fh)
+    else:
+        cur_logger.error(f"Update configuration file doesn't exist: {update_config_path}")
+        exit()
 
-    update_list = [
-        ['minimal', "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/current/rds_modernm.zip",
-         "rds_modernm.zip", 'rds_modernm/NSRLFile.txt'],
-        ['android', "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/current/RDS_android.iso",
-         "RDS_android.iso", 'NSRLFile.txt']
-    ]
+    # Exit if no update sources given
+    if 'sources' not in update_config.keys() or not update_config['sources']:
+        cur_logger.error(f"Update configuration does not contain any source to update from")
+        exit()
 
-    for x in update_list:
-        update(cur_logger, working_directory, hashes, *x)
+    previous_update = update_config.get('previous_update', None)
+    previous_hash = json.loads(update_config.get('previous_hash', None) or "{}")
+
+    for source in update_config['sources']:
+        update(cur_logger, working_directory, source, previous_update, previous_hash)
+
+    cur_logger.info("Done!")
 
 
 if __name__ == "__main__":
     log.init_logging('updater.whitelist')
     logger = logging.getLogger('assemblyline.updater.whitelist')
-    run_updater(logger)
+    run_updater(logger, UPDATE_CONFIGURATION_PATH)

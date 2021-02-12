@@ -32,6 +32,13 @@ dependencies:
       ram_mb: 6144
       ram_mb_min: 1024
 
+heuristics:
+  - heur_id: 1
+    name: Whitelisted
+    score: -1000
+    filetype: '*'
+    description: Hash found in whitelisting database
+
 update_config:
   update_interval_seconds: 3600
   generates_signatures: false

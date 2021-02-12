@@ -1,10 +1,11 @@
 # This updater is made to follow the NSRL file format which is a CSV file with the following format:
 # "SHA-1","MD5","CRC32","FileName","FileSize","ProductCode","OpSystemCode","SpecialCode"
 #
+# NOTE: The only field we car about is the SHA1 the others are ignored
 # You can then create your own whitelist set that matches that format to have your own set of hashes...
-import json
 
 import certifi
+import json
 import logging
 import os
 import pycdlib
@@ -25,6 +26,8 @@ except ImportError:
     from io import BytesIO
 
 UPDATE_CONFIGURATION_PATH = os.environ.get('UPDATE_CONFIGURATION_PATH', "/tmp/whitelist_updater_config.yaml")
+UPDATE_OUTPUT_PATH = os.environ.get('UPDATE_OUTPUT_PATH', "/tmp/whitelist_updater_output")
+REDIS_SERVER = os.environ.get('REDIS_SERVER', "whitelist-redisdb")
 
 
 BLOCK_SIZE = 64 * 1024
@@ -166,7 +169,7 @@ def update(cur_logger, working_directory, source, previous_update, previous_hash
 
     if os.path.exists(extracted_path) and os.path.isfile(extracted_path):
         linux_command = "awk -F, 'NR > 1{ print \"sadd\", \"\\\"hashes\\\"\", \"\"$1\"\" }' " \
-                        "%s | redis-cli --pipe" % extracted_path
+                        "%s | redis-cli -h %s --pipe" % (extracted_path, REDIS_SERVER)
         cur_logger.info(
             "Going to import %s into Redis by executing system command %s " %
             (extracted_path, linux_command))
@@ -178,11 +181,12 @@ def update(cur_logger, working_directory, source, previous_update, previous_hash
             cur_logger.info(f"\t{line.decode()}")
 
 
-def run_updater(cur_logger, update_config_path):
+def run_updater(cur_logger, update_config_path, update_output_path):
     # Setup working directory
     working_directory = os.path.join(tempfile.gettempdir(), 'whitelist_updates')
     shutil.rmtree(working_directory, ignore_errors=True)
     os.makedirs(os.path.join(working_directory, 'dl'), exist_ok=True)
+    os.makedirs(update_output_path, exist_ok=True)
 
     update_config = {}
     if update_config_path and os.path.exists(update_config_path):
@@ -203,10 +207,13 @@ def run_updater(cur_logger, update_config_path):
     for source in update_config['sources']:
         update(cur_logger, working_directory, source, previous_update, previous_hash)
 
+    # Create the response yaml
+    with open(os.path.join(update_output_path, 'response.yaml'), 'w') as yml_fh:
+        yaml.safe_dump(dict(hash="updated"), yml_fh)
     cur_logger.info("Done!")
 
 
 if __name__ == "__main__":
     log.init_logging('updater.whitelist')
     logger = logging.getLogger('assemblyline.updater.whitelist')
-    run_updater(logger, UPDATE_CONFIGURATION_PATH)
+    run_updater(logger, UPDATE_CONFIGURATION_PATH, UPDATE_OUTPUT_PATH)
